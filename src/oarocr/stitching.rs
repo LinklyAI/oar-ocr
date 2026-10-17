@@ -40,6 +40,17 @@ enum OcrSource {
 const EXCLUDED_FROM_OCR_LABELS: [LayoutElementType; 2] =
     [LayoutElementType::Table, LayoutElementType::Seal];
 
+/// A picture whose centre lies inside a table. It joins that table's cell matching
+/// as an `<img>` token, so the picture lands in the cell that holds its centre.
+struct TablePicture {
+    /// Index of the picture in `layout_elements`.
+    element_index: usize,
+    /// Index of the table, in `tables`, that holds the picture's centre.
+    table_index: usize,
+    /// A 10px region at the picture's centre whose text is the `<img>` tag.
+    token: TextRegion,
+}
+
 #[derive(Clone)]
 pub struct StitchConfig {
     pub overlap_min_pixels: f32,
@@ -79,7 +90,7 @@ impl ResultStitcher {
     /// Stitches text regions into layout elements and tables within the structure result.
     ///
     /// This method follows PP-StructureV3's fusion strategy:
-    /// 1. Stitch OCR text into tables (cell-level matching)
+    /// 1. Stitch OCR text into tables (cell-level matching), along with the pictures inside them
     /// 2. Stitch OCR text into layout elements (excluding formula/table/seal)
     /// 3. Fill formula elements with LaTeX content from formula results
     /// 4. Create new text elements for orphan OCR regions
@@ -98,6 +109,20 @@ impl ResultStitcher {
 
         tracing::debug!("Stitching: {} text regions", regions.len());
 
+        // Pictures inside tables go into the table cells, as MinerU does. Skipped with
+        // region blocks, whose element indices would go stale once placed pictures are
+        // removed below.
+        let table_pictures = if result.region_blocks.is_none() {
+            Self::collect_table_pictures(
+                &result.layout_elements,
+                &result.tables,
+                &regions,
+                &mut used_region_indices,
+            )
+        } else {
+            Vec::new()
+        };
+
         // 1. Stitch text into tables
         // For tables, we also want recognized formulas to participate in cell content
         // matching, similar to how formulas are injected into the OCR results used
@@ -106,8 +131,15 @@ impl ResultStitcher {
             &mut result.tables,
             &regions,
             &result.formulas,
+            &table_pictures,
             &mut used_region_indices,
             cfg,
+        );
+
+        Self::remove_placed_table_pictures(
+            &mut result.layout_elements,
+            &result.tables,
+            &table_pictures,
         );
 
         tracing::debug!(
@@ -400,10 +432,117 @@ impl ResultStitcher {
         )
     }
 
+    /// Finds the pictures whose centre lies inside a table and gives each one a
+    /// 10px `<img>` token at its centre for that table's cell matching.
+    ///
+    /// OCR lines mostly inside such a picture are marked used: like the text of any
+    /// picture, they go neither into the cells nor into the page text.
+    fn collect_table_pictures(
+        layout_elements: &[LayoutElement],
+        tables: &[TableResult],
+        text_regions: &[TextRegion],
+        used_indices: &mut std::collections::HashSet<usize>,
+    ) -> Vec<TablePicture> {
+        let mut pictures = Vec::new();
+        for (element_index, element) in layout_elements.iter().enumerate() {
+            if element.element_type != LayoutElementType::Image {
+                continue;
+            }
+            let b = &element.bbox;
+            let cx = (b.x_min() + b.x_max()) / 2.0;
+            let cy = (b.y_min() + b.y_max()) / 2.0;
+            let Some(table_index) = tables.iter().position(|t| {
+                t.bbox.x_min() <= cx
+                    && cx <= t.bbox.x_max()
+                    && t.bbox.y_min() <= cy
+                    && cy <= t.bbox.y_max()
+            }) else {
+                continue;
+            };
+
+            for (idx, region) in text_regions.iter().enumerate() {
+                if region.bounding_box.ioa(b) > 0.5 {
+                    used_indices.insert(idx);
+                }
+            }
+
+            let mut token = TextRegion::new(BoundingBox::from_coords(
+                cx - 5.0,
+                cy - 5.0,
+                cx + 5.0,
+                cy + 5.0,
+            ));
+            token.text = Some(
+                format!(
+                    "<img src=\"imgs/img_in_table_box_{:.0}_{:.0}_{:.0}_{:.0}.jpg\" alt=\"Image\" />",
+                    b.x_min(),
+                    b.y_min(),
+                    b.x_max(),
+                    b.y_max()
+                )
+                .into(),
+            );
+            token.confidence = Some(1.0);
+            pictures.push(TablePicture {
+                element_index,
+                table_index,
+                token,
+            });
+        }
+        pictures
+    }
+
+    /// Removes the pictures whose `<img>` token reached the HTML of a table that
+    /// `to_markdown` renders. A picture that missed every cell stays a standalone image.
+    fn remove_placed_table_pictures(
+        layout_elements: &mut Vec<LayoutElement>,
+        tables: &[TableResult],
+        pictures: &[TablePicture],
+    ) {
+        if pictures.is_empty() {
+            return;
+        }
+
+        // Same lookup as `to_markdown`: a table element renders the first table
+        // result that overlaps it with IoU > 0.5.
+        let rendered_tables: std::collections::HashSet<usize> = layout_elements
+            .iter()
+            .filter(|e| e.element_type == LayoutElementType::Table)
+            .filter_map(|e| tables.iter().position(|t| t.bbox.iou(&e.bbox) > 0.5))
+            .collect();
+
+        let placed: std::collections::HashSet<usize> = pictures
+            .iter()
+            .filter(|p| {
+                rendered_tables.contains(&p.table_index)
+                    && tables[p.table_index]
+                        .html_structure
+                        .as_deref()
+                        .zip(p.token.text.as_deref())
+                        .is_some_and(|(html, tag)| html.contains(tag))
+            })
+            .map(|p| p.element_index)
+            .collect();
+
+        tracing::debug!(
+            "Table pictures: {} placed in cells, {} kept standalone",
+            placed.len(),
+            pictures.len() - placed.len()
+        );
+
+        let mut idx = 0usize;
+        layout_elements.retain(|_| {
+            let keep = !placed.contains(&idx);
+            idx += 1;
+            keep
+        });
+    }
+
     fn stitch_tables(
         tables: &mut [TableResult],
         text_regions: &[TextRegion],
         formulas: &[FormulaResult],
+        pictures: &[TablePicture],
         used_indices: &mut std::collections::HashSet<usize>,
         cfg: &StitchConfig,
     ) {
@@ -503,6 +642,11 @@ impl ResultStitcher {
                 formula_region.text = Some(formatted.into());
                 formula_region.confidence = Some(1.0);
                 ocr_candidates.push((OcrSource::Split, formula_region));
+            }
+
+            // Pictures whose centre lies in this table join the pool the same way.
+            for picture in pictures.iter().filter(|p| p.table_index == table_idx) {
+                ocr_candidates.push((OcrSource::Split, picture.token.clone()));
             }
 
             let structure_tokens = table.structure_tokens.clone();
@@ -2082,6 +2226,7 @@ fn is_non_break_line_end_punctuation(c: char) -> bool {
 mod tests {
     use super::*;
     use crate::oarocr::TextRegion;
+    use oar_ocr_core::domain::structure::{RegionBlock, TableType};
     use oar_ocr_core::processors::BoundingBox;
 
     fn make_region(bbox: BoundingBox, text: &str) -> TextRegion {
@@ -2391,5 +2536,166 @@ mod tests {
         assert_eq!(matched.len(), 1);
         assert_eq!(mapping.get(&0), Some(&vec![0]));
         assert!(!mapping.contains_key(&1));
+    }
+
+    /// Structure tokens of a table with one row of two cells.
+    fn one_row_tokens() -> Vec<String> {
+        [
+            "<table>",
+            "<tbody>",
+            "<tr>",
+            "<td></td>",
+            "<td></td>",
+            "</tr>",
+            "</tbody>",
+            "</table>",
+        ]
+        .iter()
+        .map(|t| t.to_string())
+        .collect()
+    }
+
+    /// Two side-by-side cells spanning the table's width, `height` px tall.
+    fn one_row_cells(height: f32) -> Vec<TableCell> {
+        vec![
+            TableCell::new(BoundingBox::from_coords(0.0, 0.0, 100.0, height), 1.0),
+            TableCell::new(BoundingBox::from_coords(100.0, 0.0, 200.0, height), 1.0),
+        ]
+    }
+
+    fn table_box() -> BoundingBox {
+        BoundingBox::from_coords(0.0, 0.0, 200.0, 100.0)
+    }
+
+    /// A page with one table holding a "Reader" label at its top left, and a photo
+    /// with the word "Operator" printed on it.
+    fn page_with_photo(table: TableResult, photo: BoundingBox) -> StructureResult {
+        let cx = (photo.x_min() + photo.x_max()) / 2.0;
+        let cy = (photo.y_min() + photo.y_max()) / 2.0;
+        StructureResult::new("page.png", 0)
+            .with_layout_elements(vec![
+                LayoutElement::new(table_box(), LayoutElementType::Table, 0.9),
+                LayoutElement::new(photo, LayoutElementType::Image, 0.9),
+            ])
+            .with_tables(vec![table])
+            .with_text_regions(vec![
+                make_region(BoundingBox::from_coords(10.0, 10.0, 90.0, 30.0), "Reader"),
+                make_region(
+                    BoundingBox::from_coords(cx - 20.0, cy - 10.0, cx + 20.0, cy + 10.0),
+                    "Operator",
+                ),
+            ])
+    }
+
+    fn has_image(result: &StructureResult) -> bool {
+        result
+            .layout_elements
+            .iter()
+            .any(|e| e.element_type == LayoutElementType::Image)
+    }
+
+    /// Image elements carry the OCR text inside them, but the Markdown never shows it.
+    fn markdown_contains(result: &StructureResult, needle: &str) -> bool {
+        result.to_markdown().contains(needle)
+    }
+
+    fn table_html(result: &StructureResult) -> &str {
+        result.tables[0].html_structure.as_deref().unwrap_or("")
+    }
+
+    #[test]
+    fn test_stitch_places_table_photo_in_its_cell() {
+        let table = TableResult::new(table_box(), TableType::Wired)
+            .with_cells(one_row_cells(100.0))
+            .with_structure_tokens(one_row_tokens());
+        let mut result = page_with_photo(table, BoundingBox::from_coords(120.0, 10.0, 180.0, 90.0));
+
+        ResultStitcher::stitch(&mut result);
+
+        let html = table_html(&result);
+        assert!(html.contains("<td>Reader</td>"));
+        assert!(html.contains(
+            "<td><img src=\"imgs/img_in_table_box_120_10_180_90.jpg\" alt=\"Image\" /></td>"
+        ));
+        assert!(!html.contains("Operator"));
+        assert!(!has_image(&result));
+        assert!(!markdown_contains(&result, "Operator"));
+    }
+
+    #[test]
+    fn test_stitch_keeps_table_photo_when_table_has_no_cells() {
+        let table =
+            TableResult::new(table_box(), TableType::Wired).with_structure_tokens(one_row_tokens());
+        let mut result = page_with_photo(table, BoundingBox::from_coords(120.0, 10.0, 180.0, 90.0));
+
+        ResultStitcher::stitch(&mut result);
+
+        assert!(has_image(&result));
+        assert!(!markdown_contains(&result, "Operator"));
+    }
+
+    #[test]
+    fn test_stitch_keeps_table_photo_outside_every_cell() {
+        // The cells cover only the top 40px; the photo sits below them.
+        let table = TableResult::new(table_box(), TableType::Wired)
+            .with_cells(one_row_cells(40.0))
+            .with_structure_tokens(one_row_tokens());
+        let mut result = page_with_photo(table, BoundingBox::from_coords(120.0, 50.0, 180.0, 95.0));
+
+        ResultStitcher::stitch(&mut result);
+
+        let html = table_html(&result);
+        assert!(html.contains("<td>Reader</td>"));
+        assert!(!html.contains("<img"));
+        assert!(has_image(&result));
+        assert!(!markdown_contains(&result, "Operator"));
+    }
+
+    #[test]
+    fn test_stitch_keeps_table_photo_when_table_has_no_html() {
+        // Without structure tokens the stitcher fills the cells but builds no HTML.
+        let table =
+            TableResult::new(table_box(), TableType::Wired).with_cells(one_row_cells(100.0));
+        let mut result = page_with_photo(table, BoundingBox::from_coords(120.0, 10.0, 180.0, 90.0));
+
+        ResultStitcher::stitch(&mut result);
+
+        assert!(result.tables[0].html_structure.is_none());
+        assert!(has_image(&result));
+        assert!(!markdown_contains(&result, "Operator"));
+    }
+
+    #[test]
+    fn test_stitch_leaves_photo_outside_tables_alone() {
+        let table = TableResult::new(table_box(), TableType::Wired)
+            .with_cells(one_row_cells(100.0))
+            .with_structure_tokens(one_row_tokens());
+        let mut result = page_with_photo(table, BoundingBox::from_coords(220.0, 10.0, 280.0, 90.0));
+
+        ResultStitcher::stitch(&mut result);
+
+        assert!(!table_html(&result).contains("<img"));
+        assert!(has_image(&result));
+    }
+
+    #[test]
+    fn test_stitch_skips_table_photos_with_region_blocks() {
+        let table = TableResult::new(table_box(), TableType::Wired)
+            .with_cells(one_row_cells(100.0))
+            .with_structure_tokens(one_row_tokens());
+        let mut result = page_with_photo(table, BoundingBox::from_coords(120.0, 10.0, 180.0, 90.0));
+        result.region_blocks = Some(vec![RegionBlock {
+            bbox: table_box(),
+            confidence: 0.9,
+            order_index: Some(0),
+            element_indices: vec![0, 1],
+        }]);
+
+        ResultStitcher::stitch(&mut result);
+
+        let html = table_html(&result);
+        assert!(!html.contains("<img"));
+        assert!(html.contains("Operator"));
+        assert!(has_image(&result));
     }
 }
