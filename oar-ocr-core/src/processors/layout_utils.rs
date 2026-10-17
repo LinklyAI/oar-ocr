@@ -785,10 +785,66 @@ pub fn remove_overlap_blocks(
     }
 }
 
+/// Minimum share of an inner image box that must lie inside an image frame for the
+/// box to count as one of the frame's pictures.
+const PICTURE_GROUP_MIN_INNER_IOA: f32 = 0.8;
+
+/// Minimum share of an image frame that its pictures must cover together for the
+/// frame to count as the frame of a picture group.
+const PICTURE_GROUP_MIN_COVERAGE: f32 = 0.5;
+
+/// Area of the union of `rects` clipped to `frame`.
+///
+/// Overlapping rectangles count once: their clipped edges split the frame into a
+/// grid, and every grid cell covered by any rectangle adds its area.
+fn union_area_within(rects: &[&BoundingBox], frame: &BoundingBox) -> f32 {
+    let clipped: Vec<(f32, f32, f32, f32)> = rects
+        .iter()
+        .map(|r| {
+            (
+                r.x_min().max(frame.x_min()),
+                r.y_min().max(frame.y_min()),
+                r.x_max().min(frame.x_max()),
+                r.y_max().min(frame.y_max()),
+            )
+        })
+        .filter(|&(x1, y1, x2, y2)| x1 < x2 && y1 < y2)
+        .collect();
+
+    let mut xs: Vec<f32> = clipped.iter().flat_map(|r| [r.0, r.2]).collect();
+    let mut ys: Vec<f32> = clipped.iter().flat_map(|r| [r.1, r.3]).collect();
+    xs.sort_by(f32::total_cmp);
+    xs.dedup();
+    ys.sort_by(f32::total_cmp);
+    ys.dedup();
+
+    let mut area = 0.0;
+    for xw in xs.windows(2) {
+        for yw in ys.windows(2) {
+            let cx = (xw[0] + xw[1]) / 2.0;
+            let cy = (yw[0] + yw[1]) / 2.0;
+            if clipped
+                .iter()
+                .any(|r| r.0 <= cx && cx <= r.2 && r.1 <= cy && cy <= r.3)
+            {
+                area += (xw[1] - xw[0]) * (yw[1] - yw[0]);
+            }
+        }
+    }
+    area
+}
+
 /// Removes overlapping layout blocks, returning only indices to remove.
 ///
 /// A lighter-weight version that works with any bbox type implementing the required traits.
 /// This is useful when you want to apply overlap removal to `LayoutElement` from `domain::structure`.
+///
+/// Beyond the pairwise rule of [`remove_overlap_blocks`], two cases are handled differently:
+/// - An image box holding two or more other image boxes that together cover at least half
+///   of it frames a group of pictures: the frame is removed and the pictures are kept.
+///   One photo with a few small marks detected inside it (logos, QR codes) keeps the photo.
+/// - An image overlapping a table is kept alongside the table, so the picture can be
+///   placed into a table cell instead of being lost.
 ///
 /// # Arguments
 ///
@@ -811,6 +867,36 @@ pub fn get_overlap_removal_indices(
 
     let mut dropped_indices: HashSet<usize> = HashSet::new();
 
+    // Drop an image frame around a group of pictures, so each picture comes out on its
+    // own. The pictures must cover at least half of the frame together; otherwise the
+    // frame is one photo with small marks inside, and keeping it loses nothing.
+    for i in 0..n {
+        if labels[i] != "image" {
+            continue;
+        }
+        // A box the frame also lies mostly inside is the same picture boxed twice, not a
+        // part of it; the pairwise rule below keeps the larger of the two.
+        let pictures: Vec<&BoundingBox> = (0..n)
+            .filter(|&j| {
+                j != i
+                    && labels[j] == "image"
+                    && bboxes[j].ioa(&bboxes[i]) >= PICTURE_GROUP_MIN_INNER_IOA
+                    && bboxes[i].ioa(&bboxes[j]) < PICTURE_GROUP_MIN_INNER_IOA
+            })
+            .map(|j| &bboxes[j])
+            .collect();
+        if pictures.len() < 2 {
+            continue;
+        }
+        let frame_area =
+            (bboxes[i].x_max() - bboxes[i].x_min()) * (bboxes[i].y_max() - bboxes[i].y_min());
+        if frame_area > 0.0
+            && union_area_within(&pictures, &bboxes[i]) / frame_area >= PICTURE_GROUP_MIN_COVERAGE
+        {
+            dropped_indices.insert(i);
+        }
+    }
+
     for i in 0..n {
         if dropped_indices.contains(&i) {
             continue;
@@ -824,6 +910,14 @@ pub fn get_overlap_removal_indices(
             let overlap_ratio = calculate_ioa_smaller(&bboxes[i], &bboxes[j]);
 
             if overlap_ratio > threshold {
+                // A picture inside a table stays alongside it, as in PaddleOCR-VL and
+                // MinerU; the stitcher places it into the cell that holds its centre.
+                if matches!(
+                    (labels[i], labels[j]),
+                    ("image", "table") | ("table", "image")
+                ) {
+                    continue;
+                }
                 let is_i_image = labels[i] == "image";
                 let is_j_image = labels[j] == "image";
 
@@ -1000,5 +1094,84 @@ mod tests {
         let sorted = sort_layout_boxes(&elements, 300.0);
         assert_eq!(sorted.len(), 1);
         assert_eq!(sorted[0].label, "text");
+    }
+
+    #[test]
+    fn test_union_area_within_counts_overlap_once() {
+        let frame = BoundingBox::from_coords(0.0, 0.0, 100.0, 100.0);
+        let a = BoundingBox::from_coords(0.0, 0.0, 60.0, 50.0);
+        let b = BoundingBox::from_coords(40.0, 0.0, 100.0, 50.0);
+        // Half of this one lies outside the frame.
+        let c = BoundingBox::from_coords(0.0, 80.0, 100.0, 120.0);
+
+        let area = union_area_within(&[&a, &b, &c], &frame);
+        assert!((area - (100.0 * 50.0 + 100.0 * 20.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_overlap_removal_drops_frame_around_picture_group() {
+        // A frame around two photos side by side, with room for a caption below them.
+        let bboxes = vec![
+            BoundingBox::from_coords(0.0, 0.0, 200.0, 120.0),
+            BoundingBox::from_coords(5.0, 5.0, 95.0, 95.0),
+            BoundingBox::from_coords(105.0, 5.0, 195.0, 95.0),
+        ];
+        let labels = ["image", "image", "image"];
+
+        let removed = get_overlap_removal_indices(&bboxes, &labels, 0.5);
+        assert_eq!(removed, HashSet::from([0]));
+    }
+
+    #[test]
+    fn test_overlap_removal_keeps_photo_with_small_marks() {
+        // A device photo with two small logos detected inside it.
+        let bboxes = vec![
+            BoundingBox::from_coords(0.0, 0.0, 200.0, 150.0),
+            BoundingBox::from_coords(10.0, 10.0, 40.0, 30.0),
+            BoundingBox::from_coords(150.0, 110.0, 190.0, 140.0),
+        ];
+        let labels = ["image", "image", "image"];
+
+        let removed = get_overlap_removal_indices(&bboxes, &labels, 0.5);
+        assert!(!removed.contains(&0));
+    }
+
+    #[test]
+    fn test_overlap_removal_keeps_frame_around_near_duplicate_photo() {
+        // The detector boxed a device photo twice, with a logo inside both boxes.
+        let bboxes = vec![
+            BoundingBox::from_coords(0.0, 0.0, 200.0, 150.0),
+            BoundingBox::from_coords(5.0, 5.0, 195.0, 140.0),
+            BoundingBox::from_coords(10.0, 10.0, 40.0, 30.0),
+        ];
+        let labels = ["image", "image", "image"];
+
+        let removed = get_overlap_removal_indices(&bboxes, &labels, 0.5);
+        assert!(!removed.contains(&0));
+    }
+
+    #[test]
+    fn test_overlap_removal_keeps_frame_holding_one_picture() {
+        let bboxes = vec![
+            BoundingBox::from_coords(0.0, 0.0, 200.0, 120.0),
+            BoundingBox::from_coords(5.0, 5.0, 195.0, 95.0),
+        ];
+        let labels = ["image", "image"];
+
+        // Same-type pairs keep the larger box, as before.
+        let removed = get_overlap_removal_indices(&bboxes, &labels, 0.5);
+        assert_eq!(removed, HashSet::from([1]));
+    }
+
+    #[test]
+    fn test_overlap_removal_keeps_picture_inside_table() {
+        let bboxes = vec![
+            BoundingBox::from_coords(0.0, 0.0, 400.0, 300.0),
+            BoundingBox::from_coords(210.0, 20.0, 390.0, 140.0),
+        ];
+        let labels = ["table", "image"];
+
+        let removed = get_overlap_removal_indices(&bboxes, &labels, 0.5);
+        assert!(removed.is_empty());
     }
 }
